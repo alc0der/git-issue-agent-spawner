@@ -1,0 +1,222 @@
+#!/bin/bash
+
+# Post-commit hook for git-issue AI agent assignment
+# This hook triggers when a commit is made in the .issues repository
+# It detects issue assignments to AI agents and runs them automatically
+# Use -x in shebang for debug tracing when needed: #!/bin/bash -x
+
+set -e
+
+# Get the commit message
+COMMIT_MSG=$(git log -1 --pretty=%B)
+
+# Check if this is an assignment commit
+if ! echo "$COMMIT_MSG" | grep -q "^gi assignee"; then
+    exit 0
+fi
+
+# Extract issue ID from changed files in the commit
+ISSUE_PATH=$(git diff-tree --no-commit-id --name-only -r HEAD | grep '^issues/.*/assignee$' | head -1)
+
+if [ -z "$ISSUE_PATH" ]; then
+    echo "⚠️  Could not find assignee file in commit"
+    exit 0
+fi
+
+# Extract issue ID from path: issues/XX/YYYYYYYY.../assignee -> XXYYYYYYYY...
+ISSUE_ID=$(echo "$ISSUE_PATH" | sed -E 's|^issues/([^/]+)/([^/]+)/assignee$|\1\2|')
+
+# Get the assignee from the commit message
+ASSIGNEE=$(echo "$COMMIT_MSG" | sed -n 's/^gi assignee add \(.*\)/\1/p')
+
+if [ -z "$ISSUE_ID" ] || [ -z "$ASSIGNEE" ]; then
+    echo "⚠️  Could not parse issue ID or assignee"
+    exit 0
+fi
+
+# Validate assignee is an AI agent
+case "$ASSIGNEE" in
+    gemini|claude|gpt|copilot)
+        echo "🤖 Starting $ASSIGNEE for issue $ISSUE_ID"
+        ;;
+    *)
+        exit 0
+        ;;
+esac
+
+# Get directories
+ISSUES_DIR="$(git rev-parse --show-toplevel)"
+PARENT_DIR="$(dirname "$ISSUES_DIR")"
+GRANDPARENT_DIR="$(dirname "$PARENT_DIR")"
+WORKTREE_NAME="agent-${ASSIGNEE}-${ISSUE_ID}-$(date +%s)"
+
+# Detect if we're in a bare repository structure
+if [ -d "${GRANDPARENT_DIR}" ] && [[ "$GRANDPARENT_DIR" == *.git ]]; then
+    WORKTREE_PATH="${GRANDPARENT_DIR}/${WORKTREE_NAME}"
+else
+    WORKTREE_PATH="${PARENT_DIR}/worktrees/${WORKTREE_NAME}"
+    [ ! -d "${PARENT_DIR}/worktrees" ] && mkdir -p "${PARENT_DIR}/worktrees"
+fi
+
+# Get issue content from description file
+ISSUE_DIR_1="${ISSUE_ID:0:2}"
+ISSUE_DIR_2="${ISSUE_ID:2}"
+DESCRIPTION_FILE="${ISSUES_DIR}/issues/${ISSUE_DIR_1}/${ISSUE_DIR_2}/description"
+
+if [ ! -f "$DESCRIPTION_FILE" ]; then
+    echo "❌ Could not find description file: $DESCRIPTION_FILE"
+    exit 1
+fi
+
+ISSUE_CONTENT=$(cat "$DESCRIPTION_FILE")
+if [ -z "$ISSUE_CONTENT" ]; then
+    echo "❌ Description file is empty"
+    exit 1
+fi
+
+# Extract issue title and description
+ISSUE_TITLE=$(echo "$ISSUE_CONTENT" | head -n 1)
+ISSUE_DESC=$(echo "$ISSUE_CONTENT" | tail -n +2)
+
+# Create worktree (optional, may fail in some environments)
+if [ -d "${PARENT_DIR}/.git" ] || [ -f "${PARENT_DIR}/.git" ] || [[ "$GRANDPARENT_DIR" == *.git ]]; then
+    # Unset git environment variables and create worktree from parent directory
+    WORKTREE_OUTPUT=$(
+        cd "${PARENT_DIR}" 2>/dev/null && \
+        unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE GIT_PREFIX && \
+        git worktree add "$WORKTREE_PATH" -b "$WORKTREE_NAME" 2>&1
+    )
+
+    if [ $? -eq 0 ]; then
+        WORKING_DIR="$WORKTREE_PATH"
+    else
+        WORKING_DIR="$PARENT_DIR"
+    fi
+else
+    WORKING_DIR="$PARENT_DIR"
+fi
+
+# Prepare the prompt for the AI agent
+PROMPT="You are assigned to work on the following issue:
+
+Issue ID: $ISSUE_ID
+Title: $ISSUE_TITLE
+
+Description:
+$ISSUE_DESC
+
+Please analyze this issue and provide a solution or implementation as requested."
+
+# Check if agent command exists
+if ! command -v "$ASSIGNEE" >/dev/null 2>&1; then
+    echo "⚠️  Agent command '$ASSIGNEE' not found in PATH"
+
+    # Show notification (macOS)
+    if command -v osascript >/dev/null 2>&1; then
+        osascript -e "display notification \"Agent '$ASSIGNEE' not found\" with title \"Git Issue Assignment\""
+    fi
+    exit 1
+fi
+
+# Check if tmux is available
+if ! command -v tmux >/dev/null 2>&1; then
+    USE_SCREEN=1
+    if ! command -v screen >/dev/null 2>&1; then
+        echo "❌ Neither tmux nor screen is available"
+        exit 1
+    fi
+fi
+
+# Create a temporary file for the prompt
+PROMPT_FILE=$(mktemp /tmp/agent_prompt.XXXXXX)
+echo "$PROMPT" > "$PROMPT_FILE"
+
+# Prepare agent-specific command
+case "$ASSIGNEE" in
+    gemini)
+        AGENT_CMD="PROMPT_TEXT=\"\$(cat '$PROMPT_FILE')\" && $ASSIGNEE -i \"\$PROMPT_TEXT\" --yolo"
+        ;;
+    claude)
+        AGENT_CMD="cat '$PROMPT_FILE' | $ASSIGNEE --auto-approve"
+        ;;
+    gpt)
+        AGENT_CMD="cat '$PROMPT_FILE' | $ASSIGNEE --non-interactive"
+        ;;
+    copilot)
+        AGENT_CMD="cat '$PROMPT_FILE' | $ASSIGNEE --yes"
+        ;;
+    *)
+        AGENT_CMD="cat '$PROMPT_FILE' | $ASSIGNEE"
+        ;;
+esac
+
+# Create session name
+SESSION_NAME="${ASSIGNEE}_${ISSUE_ID:0:8}_$(date +%s)"
+
+# Create command script for session
+SCRIPT_FILE=$(mktemp /tmp/agent_script.XXXXXX)
+
+if [ "$ASSIGNEE" = "gemini" ]; then
+    cat > "$SCRIPT_FILE" << 'EOSCRIPT'
+#!/bin/bash
+cd 'WORKING_DIR_PLACEHOLDER'
+PROMPT_TEXT=$(cat 'PROMPT_FILE_PLACEHOLDER')
+gemini -i "$PROMPT_TEXT" --yolo
+AGENT_EXIT_CODE=$?
+rm -f 'PROMPT_FILE_PLACEHOLDER' 'SCRIPT_FILE_PLACEHOLDER'
+exit $AGENT_EXIT_CODE
+EOSCRIPT
+    # Replace placeholders
+    if sed --version 2>/dev/null | grep -q GNU; then
+        sed -i "s|WORKING_DIR_PLACEHOLDER|$WORKING_DIR|g" "$SCRIPT_FILE"
+        sed -i "s|PROMPT_FILE_PLACEHOLDER|$PROMPT_FILE|g" "$SCRIPT_FILE"
+        sed -i "s|SCRIPT_FILE_PLACEHOLDER|$SCRIPT_FILE|g" "$SCRIPT_FILE"
+    else
+        sed -i "" "s|WORKING_DIR_PLACEHOLDER|$WORKING_DIR|g" "$SCRIPT_FILE"
+        sed -i "" "s|PROMPT_FILE_PLACEHOLDER|$PROMPT_FILE|g" "$SCRIPT_FILE"
+        sed -i "" "s|SCRIPT_FILE_PLACEHOLDER|$SCRIPT_FILE|g" "$SCRIPT_FILE"
+    fi
+else
+    cat > "$SCRIPT_FILE" << EOF
+#!/bin/bash
+cd '$WORKING_DIR'
+$AGENT_CMD
+AGENT_EXIT_CODE=\$?
+rm -f '$PROMPT_FILE' '$SCRIPT_FILE'
+exit \$AGENT_EXIT_CODE
+EOF
+fi
+chmod +x "$SCRIPT_FILE"
+
+# Run the AI agent in a session
+if [ "$USE_SCREEN" = "1" ]; then
+    # Use screen
+    if screen -dmS "$SESSION_NAME" bash "$SCRIPT_FILE"; then
+        echo "✅ Agent $ASSIGNEE started in screen: $SESSION_NAME"
+        echo "   To attach: screen -r $SESSION_NAME"
+    else
+        echo "❌ Failed to start agent in screen session"
+        rm -f "$PROMPT_FILE" "$SCRIPT_FILE"
+        exit 1
+    fi
+else
+    # Use tmux
+    if tmux new-session -d -s "$SESSION_NAME" -c "$WORKING_DIR" "bash '$SCRIPT_FILE'"; then
+        echo "✅ Agent $ASSIGNEE started in tmux: $SESSION_NAME"
+        echo "   To attach: tmux attach -t $SESSION_NAME"
+    else
+        echo "❌ Failed to start agent in tmux session"
+        rm -f "$PROMPT_FILE" "$SCRIPT_FILE"
+        exit 1
+    fi
+fi
+
+# Show notification (macOS)
+if command -v osascript >/dev/null 2>&1; then
+    osascript -e "display notification \"$ASSIGNEE started: $SESSION_NAME\" with title \"AI Agent Started\" sound name \"Glass\""
+fi
+
+# Voice feedback (macOS)
+if command -v say >/dev/null 2>&1; then
+    say "Starting work on issue" &
+fi

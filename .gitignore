@@ -1,0 +1,29 @@
+# Temporary files
+*.tmp
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Test artifacts
+test-output/
+test-results/
+*.log
+
+# Backup files
+*.bak
+*.backup
+
+
+
+# Shell script debugging
+*.trace
+
+# IDE files
+.vscode/
+.idea/
+*.iml
+
+# Generated directories
+tmp/
+temp/
