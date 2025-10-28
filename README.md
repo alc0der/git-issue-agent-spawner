@@ -10,10 +10,27 @@ This hook detects when an issue is assigned to an AI agent (gemini, claude, gpt,
 
 ## Installation
 
+To install the hook, you can either copy it manually or use `curl` or `wget` to download it directly from GitHub.
+
+### Manual Installation
+
 Copy the post-commit hook to your `.issues/.git/hooks/` directory:
 
 ```bash
 cp ./hooks/post-commit path/to/git-issue/enabled-repo/.issues/.git/hooks/
+chmod +x .issues/.git/hooks/post-commit
+```
+> Replace `path/to/git-issue/enabled-repo` with your repo path
+
+### Using `curl` or `wget`
+
+```bash
+# Using curl
+curl -o .issues/.git/hooks/post-commit https://raw.githubusercontent.com/alc0der/git-issue-agent-spawner/main/hooks/post-commit
+chmod +x .issues/.git/hooks/post-commit
+
+# Using wget
+wget -O .issues/.git/hooks/post-commit https://raw.githubusercontent.com/alc0der/git-issue-agent-spawner/main/hooks/post-commit
 chmod +x .issues/.git/hooks/post-commit
 ```
 > Replace `path/to/git-issue/enabled-repo` with your repo path
